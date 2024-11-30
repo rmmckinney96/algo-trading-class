@@ -1,43 +1,11 @@
-[
-build-system
-]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[
-project
-]
-name = "trading-strategy-framework"
+[project]
+name = "trading_strategy"
 version = "0.1.0"
+description = "A trading strategy implementation"
 authors = [
-  { name="Your Name", email="your.email@example.com" }
+    {name = "Your Name", email = "your.email@example.com"},
 ]
-description = "A flexible trading strategy framework"
-readme = "README.md"
-requires-python = ">=3.9"
-dependencies = [
-    "pydantic>=2.0.0",
-    "pandas>=2.0.0",
-    "numpy>=1.22.0",
-    "rich>=10.0.0"
-]
-
-[
-project.optional-dependencies
-]
-dev = [
-    "pytest>=7.0.0",
-    "mypy>=1.0.0",
-    "ruff>=0.1.0"
-]
-
-[
-tool.ruff
-]
-line-length = 100
-target-version = "py39"
-
-[
-tool.mypy
-]
-strict = true
