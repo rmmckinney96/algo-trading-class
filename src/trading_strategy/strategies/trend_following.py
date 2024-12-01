@@ -2,28 +2,53 @@ from typing import List
 from trading_strategy.core.strategy import TradingStrategy
 from trading_strategy.models.market_data import MarketData
 from trading_strategy.models.position import Position, PositionSide
-from trading_strategy.indicators.technical import calculate_sma, calculate_atr
+from trading_strategy.indicators.technical import calculate_indicators_vectorized
+from trading_strategy.indicators.registry import IndicatorRegistry
+import numpy as np
+
+# Register a custom indicator
+@IndicatorRegistry.register('momentum')
+def calculate_momentum(prices: np.ndarray, period: int) -> np.ndarray:
+    """Custom momentum indicator"""
+    momentum = np.zeros_like(prices)
+    momentum[period:] = prices[period:] - prices[:-period]
+    return momentum
 
 class TrendFollowingStrategy(TradingStrategy):
     def __init__(self, config):
         super().__init__(config)
         self.price_history: List[MarketData] = []
+        self.indicator_configs = {
+            'sma_20': {'period': 20},
+            'sma_50': {'period': 50},
+            'atr_14': {'period': 14},
+            'momentum_10': {'period': 10}  # Easy to add new indicators
+        }
     
     def calculate_indicators(self, market_data: MarketData) -> MarketData:
         # Store price history for indicator calculations
         self.price_history.append(market_data)
         
-        # Calculate indicators using price history
-        market_data.indicators["sma_20"] = calculate_sma(self.price_history, 20)
-        market_data.indicators["sma_50"] = calculate_sma(self.price_history, 50)
-        market_data.indicators["atr"] = calculate_atr(self.price_history, 14)
+        # Calculate all indicators at once using vectorized function
+        # Get maximum period from indicator configs
+        max_period = max(
+            config['period'] for config in self.indicator_configs.values()
+        )
+        
+        if len(self.price_history) >= max_period:
+            indicators = calculate_indicators_vectorized(
+                self.price_history, 
+                self.indicator_configs
+            )[-1]  # Get latest values
+            market_data.indicators.update(indicators)
         
         # Update equity curve with unrealized PnL if we have an open position
         if self.position:
-            if self.position.side == PositionSide.LONG:
-                unrealized_pnl = (market_data.close - self.position.entry_price) * self.position.size
-            else:
-                unrealized_pnl = (self.position.entry_price - market_data.close) * self.position.size
+            unrealized_pnl = (
+                (market_data.close - self.position.entry_price) 
+                if self.position.side == PositionSide.LONG 
+                else (self.position.entry_price - market_data.close)
+            ) * self.position.size
             self.update_equity(market_data.timestamp, unrealized_pnl)
         
         return market_data

@@ -1,8 +1,10 @@
 #%% [markdown]
 # # Trend Following Strategy Demo
+
 #
 # This file is configured to run in VS Code's Interactive Window.
 
+# ## Load and prepare market data
 #%%
 import pandas as pd
 from trading_strategy.models.backtest import BacktestRunner
@@ -10,7 +12,6 @@ from trading_strategy.models.strategy_config import StrategyConfig, RiskConfig
 from trading_strategy.models.market_data import MarketData
 from trading_strategy.visualization.performance import PerformanceVisualizer
 
-# Load and prepare market data
 df = pd.read_csv('../data/raw/USDJPY.csv')
 market_data = [
     MarketData(
@@ -24,7 +25,10 @@ market_data = [
     ) for _, row in df.iterrows()
 ]
 
-# Configure and run backtest
+#%% [markdown]
+# ## Configure and run backtest
+
+#%%
 strategy_config = StrategyConfig(
     initial_capital=100000,
     risk_config=RiskConfig(
@@ -45,5 +49,4 @@ results = runner.run(market_data)
 visualizer = PerformanceVisualizer(results)
 visualizer.print_summary()
 visualizer.plot_summary()
-visualizer.plot_monthly_returns() 
 # %%
