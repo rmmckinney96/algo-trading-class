@@ -1,42 +1,52 @@
-from typing import List, Dict, Any
 import numpy as np
-from .registry import IndicatorRegistry
+from typing import List
 from trading_strategy.models.market_data import MarketData
 
-def calculate_indicators_vectorized(data_points: List[MarketData], indicator_configs: Dict[str, Any]) -> List[dict]:
-    """Vectorized calculation of multiple indicators"""
-    # Convert to numpy arrays once
-    prices = np.array([point.close for point in data_points])
-    highs = np.array([point.high for point in data_points])
-    lows = np.array([point.low for point in data_points])
+def calculate_sma(data_points: List[MarketData], period: int) -> float:
+    """
+    Calculate Simple Moving Average
     
-    results = []
-    n = len(prices)
+    Args:
+        data_points: List of market data points
+        period: Period for SMA calculation
+        
+    Returns:
+        float: SMA value
+    """
+    if len(data_points) < period:
+        return None
+        
+    prices = [point.close for point in data_points[-period:]]
+    return np.mean(prices)
+
+def calculate_atr(data_points: List[MarketData], period: int) -> float:
+    """
+    Calculate Average True Range
     
-    # Calculate each indicator using registry
-    indicator_values = {}
-    for name, config in indicator_configs.items():
-        # Parse indicator name and period
-        if '_' in name:
-            base_name, period = name.rsplit('_', 1)
-            period = int(period)
-        else:
-            base_name, period = name, config.get('period', 14)
-            
-        # Get indicator function from registry
-        indicator_func = IndicatorRegistry.get_indicator(base_name)
-        if indicator_func:
-            if base_name == 'atr':
-                values = indicator_func(highs, lows, prices, period)
-            else:
-                values = indicator_func(prices, period)
-            indicator_values[name] = values
+    Args:
+        data_points: List of market data points
+        period: Period for ATR calculation
+        
+    Returns:
+        float: ATR value
+    """
+    if len(data_points) < 2:
+        return None
+        
+    true_ranges = []
+    for i in range(1, len(data_points)):
+        high = data_points[i].high
+        low = data_points[i].low
+        prev_close = data_points[i-1].close
+        
+        tr1 = high - low
+        tr2 = abs(high - prev_close)
+        tr3 = abs(low - prev_close)
+        
+        true_range = max(tr1, tr2, tr3)
+        true_ranges.append(true_range)
     
-    # Combine results
-    for i in range(n):
-        indicators = {}
-        for name, values in indicator_values.items():
-            indicators[name] = float(values[i]) if not np.isnan(values[i]) else None
-        results.append(indicators)
-    
-    return results 
+    if len(true_ranges) < period:
+        return None
+        
+    return np.mean(true_ranges[-period:]) 

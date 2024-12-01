@@ -8,7 +8,6 @@ from trading_strategy.models.equity import EquityPoint
 from trading_strategy.models.strategy_config import StrategyConfig
 from trading_strategy.models.market_data import MarketData
 from trading_strategy.strategies.trend_following import TrendFollowingStrategy
-from trading_strategy.indicators.technical import calculate_indicators_vectorized
 
 class TradeMetrics(BaseModel):
     """Statistics for a set of trades"""
@@ -33,7 +32,6 @@ class BacktestResults(BaseModel):
     trades: List[Position]
     equity_curve: List[EquityPoint]
     metrics: TradeMetrics
-    market_data: List[MarketData]
     
     @property
     def duration(self) -> timedelta:
@@ -51,21 +49,6 @@ class BacktestRunner(BaseModel):
     strategy_config: StrategyConfig
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
-    transaction_cost_pct: float = 0.001  # 0.1% per trade
-    spread_cost_pips: float = 2.0  # Typical USDJPY spread
-    financing_rate: float = 0.02  # 2% annual financing cost
-    
-    def calculate_transaction_costs(self, position_size: float) -> float:
-        """Calculate total transaction costs including spread and commission"""
-        commission = abs(position_size) * self.transaction_cost_pct
-        spread_cost = abs(position_size) * (self.spread_cost_pips / 100)  # Convert pips to price
-        return commission + spread_cost
-    
-    def calculate_financing_cost(self, position_size: float, hold_time_days: float) -> float:
-        """Calculate financing costs for holding positions"""
-        daily_rate = self.financing_rate / 365
-        financing_cost = position_size * daily_rate * hold_time_days
-        return financing_cost
     
     def run(self, market_data: List[MarketData]) -> BacktestResults:
         """Run backtest and return results"""
@@ -148,21 +131,5 @@ class BacktestRunner(BaseModel):
             max_drawdown_pct=max_drawdown,
             trades=strategy.trades,
             equity_curve=strategy.equity_curve,
-            metrics=metrics,
-            market_data=market_data
+            metrics=metrics
         )
-    
-    def process_batch(self, market_data_batch: List[MarketData], batch_size: int = 1000) -> None:
-        """Process market data in batches for better memory efficiency"""
-        for i in range(0, len(market_data_batch), batch_size):
-            batch = market_data_batch[i:i + batch_size]
-            # Calculate indicators for batch
-            indicators = calculate_indicators_vectorized(
-                self.price_history[-100:] + batch,  # Keep some history for calculations
-                self.strategy.indicator_periods
-            )
-            
-            # Update market data with indicators
-            for market_data, indicator_values in zip(batch, indicators):
-                market_data.indicators.update(indicator_values)
-                self.process_market_data(market_data)
