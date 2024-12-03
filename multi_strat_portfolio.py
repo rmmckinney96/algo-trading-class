@@ -51,7 +51,7 @@ def load_signals(file_paths_config):
     print(f"Unique symbols in signals: {signals['symbol'].unique()}")
     return signals
 
-def get_ticks(pair, grain='1H', directory='data/'):
+def get_ticks(pair, grain='1H', directory='prices/'):
     """
     Load and process tick data for a given symbol
     """
@@ -70,7 +70,13 @@ def get_ticks(pair, grain='1H', directory='data/'):
     matching_files = glob.glob(pattern)
     
     if not matching_files:
+        print(f"All files in directory:")
+        all_files = os.listdir(abs_directory)
+        for file in all_files:
+            print(f"  - {file}")
         raise FileNotFoundError(f"No price data files found for {pair} in {abs_directory}")
+    else:
+        print(f"Found matching files: {matching_files}")
     
     # Load the CSV file
     file = matching_files[0]
@@ -102,7 +108,7 @@ def get_ticks(pair, grain='1H', directory='data/'):
     df_r1['asset'] = pair
     return df_r1
 
-def get_price_data(symbols, grain='1H', directory='data/'):
+def get_price_data(symbols, grain='1H', directory='prices/'):
     """
     Fetch OHLC data and calculate returns for multiple symbols
     """
@@ -202,8 +208,14 @@ signal_configs = [
 # Load and process signals
 signals = load_signals(signal_configs)
 
-# Get price data
-price_data = get_price_data(signals['symbol'].unique())
+# Before calling get_price_data
+unique_symbols = signals['symbol'].unique()
+print("\nSymbols from signals:")
+for symbol in unique_symbols:
+    print(f"  - {symbol}")
+
+# Get price data with correct directory
+price_data = get_price_data(signals['symbol'].unique(), directory='prices/')
 
 # Calculate strategy returns
 strategy_returns = calculate_strategy_returns(signals, price_data)
