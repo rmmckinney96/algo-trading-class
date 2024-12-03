@@ -4,14 +4,12 @@
 
 # %% Modules
 import pandas as pd
-import glob  # Add missing import for glob module
+import glob
 import os
 
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE_ROOT = os.path.dirname(SCRIPT_DIR)  # Parent directory of the script directory
 print(f"Script directory: {SCRIPT_DIR}")
-print(f"Workspace root: {WORKSPACE_ROOT}")
 
 def load_signals(file_paths_config):
     """
@@ -46,8 +44,14 @@ def load_signals(file_paths_config):
             else:
                 temp_df[col] = mapping
         
+        # Convert timestamp to datetime and localize to NY timezone
+        temp_df['timestamp'] = pd.to_datetime(temp_df['timestamp'])
+        temp_df['timestamp'] = temp_df['timestamp'].dt.tz_localize('America/New_York', ambiguous='infer')
+        
         signals = pd.concat([signals, temp_df], ignore_index=True)
     
+    # Sort signals by timestamp
+    signals = signals.sort_values('timestamp')
     print(f"Unique symbols in signals: {signals['symbol'].unique()}")
     return signals
 
@@ -55,8 +59,8 @@ def get_ticks(pair, grain='1H', directory='prices/'):
     """
     Load and process tick data for a given symbol
     """
-    # Use workspace root for data directory
-    abs_directory = os.path.join(WORKSPACE_ROOT, directory)
+    # Use script directory instead of workspace root for data directory
+    abs_directory = os.path.join(SCRIPT_DIR, directory)  # Changed from WORKSPACE_ROOT to SCRIPT_DIR
     print(f"\nLooking for price data:")
     print(f"Symbol: {pair}")
     print(f"Directory: {abs_directory}")
@@ -94,7 +98,8 @@ def get_ticks(pair, grain='1H', directory='prices/'):
     # Localize the index to 'America/New_York' timezone
     df.index = df.index.tz_localize('America/New_York', ambiguous='infer')
 
-    # Resample to desired granularity
+    # Resample to desired granularity (change 'H' to 'h')
+    grain = grain.replace('H', 'h')  # Convert 'H' to 'h' for newer pandas versions
     df_r1 = df.resample(grain).agg({
         'Open': 'first',
         'High': 'max',
@@ -103,9 +108,10 @@ def get_ticks(pair, grain='1H', directory='prices/'):
         'Volume': 'sum'
     })
 
-    # Drop any rows with NaN values
+    # Drop any rows with NaN values and duplicates
     df_r1 = df_r1.dropna(subset=['Open', 'High', 'Low', 'Close'])
-    df_r1['asset'] = pair
+    df_r1 = df_r1[~df_r1.index.duplicated(keep='first')]
+    df_r1['symbol'] = pair
     return df_r1
 
 def get_price_data(symbols, grain='1H', directory='prices/'):
@@ -147,27 +153,36 @@ def calculate_strategy_returns(signals, price_data):
                 print(f"Skipping {strategy}_{symbol} - no price data available")
                 continue
                 
-            # Get signals for this strategy-symbol combination
-            strat_signals = signals[
-                (signals['strategy'] == strategy) & 
-                (signals['symbol'] == symbol)
-            ].set_index('timestamp')
-            
-            # Get corresponding price data
-            symbol_prices = price_data[symbol]
-            
             try:
-                # Align signals with returns
-                aligned_signals = strat_signals['signal'].reindex(
-                    symbol_prices.index, 
-                    method='ffill'
-                ).fillna(0)
+                # Get signals for this strategy-symbol combination
+                strat_signals = signals[
+                    (signals['strategy'] == strategy) & 
+                    (signals['symbol'] == symbol)
+                ].copy()  # Create a copy to avoid SettingWithCopyWarning
+                
+                # Set timestamp as index
+                strat_signals.set_index('timestamp', inplace=True)
+                
+                # Get corresponding price data
+                symbol_prices = price_data[symbol]
+                
+                # Ensure both indexes are timezone-aware and aligned
+                if strat_signals.index.tz != symbol_prices.index.tz:
+                    strat_signals.index = strat_signals.index.tz_convert(symbol_prices.index.tz)
+                
+                # Align signals with returns using reindex and handle downcasting properly
+                aligned_signals = (strat_signals['signal']
+                    .reindex(symbol_prices.index)
+                    .astype(float)  # Convert to float first
+                    .ffill()  # Use ffill() instead of fillna(method='ffill')
+                    .fillna(0))  # Fill remaining NaNs with 0
                 
                 # Calculate strategy returns
                 strategy_returns[f"{strategy}_{symbol}"] = (
                     aligned_signals * symbol_prices['returns'].shift(-1)
                 )
                 print(f"Successfully calculated returns for {strategy}_{symbol}")
+                
             except Exception as e:
                 print(f"Error calculating returns for {strategy}_{symbol}: {str(e)}")
                 continue
@@ -216,6 +231,19 @@ for symbol in unique_symbols:
 
 # Get price data with correct directory
 price_data = get_price_data(signals['symbol'].unique(), directory='prices/')
+
+# Add this before calculating strategy returns
+print("\nDebug information:")
+for symbol in price_data:
+    print(f"\n{symbol} price data:")
+    print(f"Index timezone: {price_data[symbol].index.tz}")
+    print(f"First timestamp: {price_data[symbol].index[0]}")
+    print(f"Last timestamp: {price_data[symbol].index[-1]}")
+
+print("\nSignals information:")
+print(f"First timestamp: {signals['timestamp'].min()}")
+print(f"Last timestamp: {signals['timestamp'].max()}")
+print(f"Timestamp dtype: {signals['timestamp'].dtype}")
 
 # Calculate strategy returns
 strategy_returns = calculate_strategy_returns(signals, price_data)
