@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Dict, Optional
 
 # Import our modules
-from modules.portfolio import Strategy, Portfolio, KellyPortfolio
+from modules.portfolio import Strategy, Portfolio, KellyPortfolio, BadStrategyPortfolio
 from modules.data_loader import load_signals, get_price_data
 from modules.visualization import (
     plot_strategy_comparison, 
@@ -22,7 +22,7 @@ from modules.visualization import (
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# %% Example usage:
+# %% Load and process data
 signal_configs = [
     {
         'file_path': "trade_logs/all_trading_logs.csv",
@@ -57,35 +57,13 @@ costs_config = {
     'borrowing_cost_pa': 0.01      # 1% annual borrowing cost
 }
 
-# %% Load and process data
-# Load signals
+# Load signals and price data
 signals = load_signals(signal_configs)
-
-# Get unique symbols
-unique_symbols = signals['symbol'].unique()
-print("\nSymbols from signals:")
-for symbol in unique_symbols:
-    print(f"  - {symbol}")
-
-# Load price data
 price_data = get_price_data(signals['symbol'].unique(), directory='prices/')
 
-# Print debug information
-print("\nDebug information:")
-for symbol in price_data:
-    print(f"\n{symbol} price data:")
-    print(f"Index timezone: {price_data[symbol].index.tz}")
-    print(f"First timestamp: {price_data[symbol].index[0]}")
-    print(f"Last timestamp: {price_data[symbol].index[-1]}")
-
-print("\nSignals information:")
-print(f"First timestamp: {signals['timestamp'].min()}")
-print(f"Last timestamp: {signals['timestamp'].max()}")
-print(f"Timestamp dtype: {signals['timestamp'].dtype}")
-
 # %% Create and run portfolio
-# Initialize Kelly Portfolio instead of regular Portfolio
-portfolio = KellyPortfolio(initial_capital=1000000, lookback_days=30)
+# Initialize portfolio
+portfolio = Portfolio(initial_capital=1000000)
 
 # Create strategies from signals
 for strategy_name in signals['strategy'].unique():
@@ -96,36 +74,96 @@ for strategy_name in signals['strategy'].unique():
 # Calculate returns
 portfolio_returns = portfolio.calculate_returns(price_data, costs_config)
 
-# %% Portfolio Overview
-print("\nPortfolio Overview")
-print("-----------------")
-plot_strategy_comparison(portfolio)
-plot_portfolio_metrics(portfolio)
-plot_drawdowns(portfolio)
+# %% Portfolio PnL Analysis
+print("\nPortfolio Summary")
+print("================")
+summary = portfolio.get_pnl_summary()
+print(summary)
+
+print("\nStrategy PnL Breakdown")
+print("=====================")
+for strategy_name in portfolio.strategies:
+    strategy_pnl = portfolio.get_strategy_pnl(strategy_name)
+    print(f"\n{strategy_name}:")
+    print(f"Allocated Capital: ${strategy_pnl['allocated_capital'].iloc[-1]:,.2f}")
+    print(f"Realized PnL: ${strategy_pnl['realized_pnl'].iloc[-1]:,.2f}")
+    print(f"Unrealized PnL: ${strategy_pnl['unrealized_pnl'].iloc[-1]:,.2f}")
+    print(f"Total Costs: ${strategy_pnl['total_costs'].iloc[-1]:,.2f}")
+    print(f"Net PnL: ${(strategy_pnl['realized_pnl'].iloc[-1] + strategy_pnl['unrealized_pnl'].iloc[-1] - strategy_pnl['total_costs'].iloc[-1]):,.2f}")
+    
+    # Get trade history for this strategy
+    trades = portfolio.strategies[strategy_name].get_trade_history()
+    if not trades.empty:
+        print(f"Number of trades: {len(trades)}")
+        print(f"Average trade PnL: ${trades['realized_pnl'].mean():,.2f}")
+        print(f"Win rate: {(trades['realized_pnl'] > 0).mean():.1%}")
+
+# %% Plot PnL Evolution
+plt.figure(figsize=(12, 6))
+portfolio.total_pnl.set_index('timestamp')['portfolio_value'].plot(
+    title='Portfolio Value Evolution'
+)
+plt.grid(True)
+plt.ylabel('Portfolio Value ($)')
+plt.show()
+
+# Plot strategy capital allocation
+plt.figure(figsize=(12, 6))
+capital_history = portfolio.capital_history.pivot(
+    index='timestamp', 
+    columns='strategy', 
+    values='allocated_capital'
+)
+capital_history.plot(
+    title='Strategy Capital Allocation',
+    stacked=True
+)
+plt.grid(True)
+plt.ylabel('Allocated Capital ($)')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
+
+# Plot cumulative PnL by strategy
+plt.figure(figsize=(12, 6))
+for strategy_name in portfolio.strategies:
+    strategy_pnl = portfolio.get_strategy_pnl(strategy_name)
+    net_pnl = strategy_pnl['realized_pnl'] + strategy_pnl['unrealized_pnl'] - strategy_pnl['total_costs']
+    net_pnl.plot(label=strategy_name)
+plt.title('Cumulative Strategy PnL')
+plt.grid(True)
+plt.ylabel('PnL ($)')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
 
 # %% Individual Strategy Analysis
-print("\nIndividual Strategy Analysis")
-print("-------------------------")
-for strategy_name in signals['strategy'].unique():
-    print(f"\nAnalyzing {strategy_name}")
-    plot_strategy_analysis(
-        portfolio,
-        strategy_name=strategy_name,
-        start_date=signals['timestamp'].min(),
-        end_date=signals['timestamp'].max()
-    )
-
-# %% Time Period Analysis
-# Example: Last 6 months analysis
-end_date = signals['timestamp'].max()
-start_date = end_date - pd.Timedelta(days=180)
-
-print("\nLast 6 Months Analysis")
-print("--------------------")
-plot_strategy_analysis(
-    portfolio,
-    start_date=start_date,
-    end_date=end_date
-)
+for strategy_name in portfolio.strategies:
+    print(f"\nDetailed Analysis: {strategy_name}")
+    print("=" * (18 + len(strategy_name)))
+    
+    strategy = portfolio.strategies[strategy_name]
+    trades = strategy.get_trade_history()
+    
+    if not trades.empty:
+        trades['duration'] = trades['exit_time'] - trades['entry_time']
+        trades['return'] = trades['realized_pnl'] / (trades['entry_price'] * abs(trades['size']))
+        
+        print("\nTrade Statistics:")
+        print(f"Total trades: {len(trades)}")
+        print(f"Win rate: {(trades['realized_pnl'] > 0).mean():.1%}")
+        print(f"Average trade duration: {trades['duration'].mean()}")
+        print(f"Average return per trade: {trades['return'].mean():.2%}")
+        print(f"Best trade: ${trades['realized_pnl'].max():,.2f}")
+        print(f"Worst trade: ${trades['realized_pnl'].min():,.2f}")
+        
+        # Plot trade PnL distribution
+        plt.figure(figsize=(10, 5))
+        trades['realized_pnl'].hist(bins=50)
+        plt.title(f'{strategy_name} - Trade PnL Distribution')
+        plt.xlabel('PnL ($)')
+        plt.ylabel('Frequency')
+        plt.grid(True)
+        plt.show()
 
 # %%
