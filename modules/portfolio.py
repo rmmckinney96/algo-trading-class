@@ -155,6 +155,7 @@ class Positions:
             return pd.DataFrame()
         
         position_metrics = []
+        processed_positions = set()  # Track which positions we've already processed
         
         # Add open positions
         for position in self.positions.values():
@@ -170,10 +171,16 @@ class Positions:
                     metrics = position.get_metrics()
             
             position_metrics.append(metrics)
+            processed_positions.add(position.symbol)  # Track that we've processed this position
         
         # Add closed positions
         for position in self.closed_positions:
+            # Skip if we've already processed this position
+            if position.symbol in processed_positions:
+                continue
+            
             if timestamp and position.exit_time > timestamp:
+                # Position was still open at timestamp
                 relevant_prices = [(t, p) for t, p in position.price_history if t <= timestamp]
                 if relevant_prices:
                     last_price = relevant_prices[-1][1]
@@ -184,8 +191,12 @@ class Positions:
                     position_copy.update(last_price, timestamp)
                     metrics = position_copy.get_metrics()
                     position_metrics.append(metrics)
+                    processed_positions.add(position.symbol)
             elif not timestamp or position.exit_time <= timestamp:
-                position_metrics.append(position.get_metrics())
+                # Position was already closed
+                metrics = position.get_metrics()
+                position_metrics.append(metrics)
+                processed_positions.add(position.symbol)
         
         if not position_metrics:
             return pd.DataFrame()
@@ -425,70 +436,6 @@ class Strategy(Positions):
         
         return position_adjustments
     
-    def get_trade_history(self) -> pd.DataFrame:
-        """Get history of all closed trades"""
-        if not self.closed_positions:
-            return pd.DataFrame()
-        
-        trade_history = []
-        for position in self.closed_positions:
-            if position.exit_time is not None:  # Only include fully closed positions
-                trade_history.append({
-                    'symbol': position.symbol,
-                    'entry_time': position.entry_time,
-                    'exit_time': position.exit_time,
-                    'entry_price': position.entry_price,
-                    'exit_price': position.exit_price,
-                    'size': position.size,
-                    'direction': position.direction,
-                    'realized_pnl': position.realized_pnl,
-                    'costs': position.costs,
-                    'max_favorable_excursion': position.max_favorable_excursion,
-                    'max_adverse_excursion': position.max_adverse_excursion
-                })
-        
-        return pd.DataFrame(trade_history)
-    
-    def get_pnl_history(self) -> pd.DataFrame:
-        """Get PnL history for all positions"""
-        if not self.positions and not self.closed_positions:
-            return pd.DataFrame()
-        
-        # Combine price history from all positions
-        all_prices = []
-        
-        for position in self.positions.values():
-            for timestamp, price in position.price_history:
-                all_prices.append({
-                    'timestamp': timestamp,
-                    'symbol': position.symbol,
-                    'unrealized_pnl': position.unrealized_pnl,
-                    'realized_pnl': position.realized_pnl,
-                    'costs': position.costs
-                })
-        
-        for position in self.closed_positions:
-            for timestamp, price in position.price_history:
-                all_prices.append({
-                    'timestamp': timestamp,
-                    'symbol': position.symbol,
-                    'unrealized_pnl': position.unrealized_pnl,
-                    'realized_pnl': position.realized_pnl,
-                    'costs': position.costs
-                })
-        
-        if not all_prices:
-            return pd.DataFrame()
-        
-        # Convert to DataFrame and aggregate by timestamp
-        pnl_df = pd.DataFrame(all_prices)
-        pnl_df = pnl_df.groupby('timestamp').agg({
-            'unrealized_pnl': 'sum',
-            'realized_pnl': 'sum',
-            'costs': 'sum'
-        }).reset_index()
-        
-        return pnl_df
 
 class Portfolio(Positions, ABC):
     def __init__(self, initial_capital: float = 1000000):
