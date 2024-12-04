@@ -226,4 +226,26 @@ for strategy_name in portfolio.strategies:
         plt.grid(True)
         plt.show()
 
+# %% Portfolio Positions
+print("\nCurrent Portfolio Positions")
+print("==========================")
+positions = portfolio.get_portfolio_positions()
+if not positions.empty:
+    print(positions.to_string(index=False))
+else:
+    print("No open positions")
+
+# Optional: Get summary by strategy
+if not positions.empty:
+    print("\nPosition Summary by Strategy")
+    print("===========================")
+    strategy_summary = positions.groupby('strategy').agg({
+        'current_size': 'count',
+        'unrealized_pnl': 'sum',
+        'realized_pnl': 'sum',
+        'costs': 'sum',
+        'net_pnl': 'sum'
+    }).round(2)
+    print(strategy_summary)
+
 # %%
