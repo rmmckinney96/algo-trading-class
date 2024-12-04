@@ -6,18 +6,6 @@ from typing import Dict, List
 def load_signals(file_paths_config: List[Dict]) -> pd.DataFrame:
     """
     Load and format trading signals from multiple sources
-    
-    Parameters:
-    -----------
-    file_paths_config : list of dicts
-        Each dict contains:
-        - file_path: path to csv file (relative to script directory)
-        - mapping_config: dict with column mappings and/or fixed values
-    
-    Returns:
-    --------
-    pd.DataFrame
-        Combined signals dataframe with standardized format
     """
     # Initialize signals DataFrame with proper dtypes
     signals = pd.DataFrame({
@@ -85,10 +73,10 @@ def get_ticks(pair: str, grain: str = '1H', directory: str = 'prices/') -> pd.Da
     file = matching_files[0]
     df = pd.read_csv(file)
 
-    # Clean the 'Local time' column
+    # Clean the 'Local time' column and convert to timestamp
     df['Local time'] = df['Local time'].str.replace(r' GMT[+-]\d{4}', '', regex=True)
-    df['Local time'] = pd.to_datetime(df['Local time'], format="%d.%m.%Y %H:%M:%S.%f")
-    df.set_index('Local time', inplace=True)
+    df['timestamp'] = pd.to_datetime(df['Local time'], format="%d.%m.%Y %H:%M:%S.%f")
+    df.set_index('timestamp', inplace=True)
     df.index = df.index.tz_localize('America/New_York', ambiguous='infer')
 
     # Resample to desired granularity
