@@ -129,10 +129,11 @@ class Position:
 
 class Positions:
     """Base class for managing positions and tracking their history"""
-    def __init__(self, name: str):
+    def __init__(self, name: str, initial_capital: float = 0):
         self.name = name
-        self.positions: Dict[str, Position] = {}  # Current open positions
-        self.closed_positions = []  # History of closed positions
+        self.allocated_capital = initial_capital
+        self.positions: Dict[str, Position] = {}
+        self.closed_positions = []
         
         # History tracking
         self.capital_history = pd.DataFrame(columns=[
@@ -274,17 +275,21 @@ class Positions:
             # Calculate return
             strategy_return = net_pnl / prev_value if prev_value != 0 else 0
         
+        # Calculate portfolio value
+        portfolio_value = (metrics['allocated_capital'] + 
+                          metrics['realized_pnl'] + 
+                          metrics['unrealized_pnl'] - 
+                          metrics['total_costs'])
+        
+        # Update allocated capital to be the portfolio value
+        self.allocated_capital = portfolio_value
+        metrics['allocated_capital'] = portfolio_value
+        
         # Update capital history
         self.capital_history = pd.concat([
             self.capital_history,
             pd.DataFrame([metrics])
         ], ignore_index=True)
-        
-        # Calculate portfolio value
-        portfolio_value = (metrics['allocated_capital'] + 
-                         metrics['realized_pnl'] + 
-                         metrics['unrealized_pnl'] - 
-                         metrics['total_costs'])
         
         # Update PnL history
         pnl_metrics = {
@@ -309,9 +314,8 @@ class Positions:
 
 class Strategy(Positions):
     def __init__(self, name: str, signals: pd.DataFrame):
-        super().__init__(name)
+        super().__init__(name)  # No initial capital - will be set by Portfolio
         self.signals = signals.set_index('timestamp').copy()
-        self.allocated_capital = 0.0
     
     def process_signals(self, price_data: Dict[str, pd.DataFrame], costs_config: Dict, 
                        start_time: pd.Timestamp = None, portfolio: 'Portfolio' = None):
@@ -439,47 +443,22 @@ class Strategy(Positions):
 
 class Portfolio(Positions, ABC):
     def __init__(self, initial_capital: float = 1000000):
-        super().__init__("Portfolio")
-        self.initial_capital = initial_capital
-        self.current_capital = initial_capital
+        super().__init__("Portfolio", initial_capital)
         self.strategies: Dict[str, Strategy] = {}
         self.allocations: Dict[str, float] = {}
         self.allocation_signs: Dict[str, int] = {}
         self.cash_allocation = 0.0
         self.rebalance_history = []
-        
-        # Track capital and PnL
-        self.capital_history = pd.DataFrame(columns=[
-            'timestamp', 'strategy', 'allocated_capital', 
-            'realized_pnl', 'unrealized_pnl', 'total_costs'
-        ])
-        self.total_pnl = pd.DataFrame(columns=[
-            'timestamp', 'total_allocated', 'total_realized_pnl',
-            'total_unrealized_pnl', 'total_costs', 'cash_balance',
-            'portfolio_value'
-        ])
-        self.returns = pd.DataFrame()
     
     def _update_strategy_allocation(self, strategy_name: str, new_alloc: float) -> tuple:
         """Update a single strategy's allocation"""
         strategy = self.strategies[strategy_name]
-        new_capital = self.current_capital * new_alloc
+        new_capital = self.allocated_capital * new_alloc
         strategy_adjustments = strategy.update_allocation(new_capital)
         return strategy_name, strategy_adjustments
     
     def add_strategy(self, strategy: Strategy, allocation: float, inverse: bool = False):
-        """
-        Add strategy with initial allocation
-        
-        Parameters:
-        -----------
-        strategy : Strategy
-            Strategy to add
-        allocation : float
-            Capital allocation (0 to 1)
-        inverse : bool
-            Whether to take inverse positions
-        """
+        """Add strategy with initial allocation"""
         if allocation < 0 or allocation > 1:
             raise ValueError("Allocation must be between 0 and 1")
             
@@ -489,7 +468,7 @@ class Portfolio(Positions, ABC):
         self.strategies[strategy.name] = strategy
         self.allocations[strategy.name] = allocation
         self.allocation_signs[strategy.name] = -1 if inverse else 1
-        strategy.allocated_capital = self.current_capital * allocation
+        strategy.allocated_capital = self.allocated_capital * allocation
     
     @abstractmethod
     def optimize_allocations(self) -> Dict[str, float]:
@@ -562,7 +541,7 @@ class Portfolio(Positions, ABC):
                 total_pnl += pnl_data['portfolio_value']
             
             # Update portfolio PnL
-            portfolio_data = self.update_pnl(timestamp, self.current_capital)
+            portfolio_data = self.update_pnl(timestamp, self.allocated_capital)
             
             # Record returns
             for strategy_name, strategy_return in strategy_returns.items():
@@ -674,7 +653,7 @@ class Portfolio(Positions, ABC):
         total_realized = sum(m['realized_pnl'] for m in strategy_metrics)
         total_unrealized = sum(m['unrealized_pnl'] for m in strategy_metrics)
         total_costs = sum(m['total_costs'] for m in strategy_metrics)
-        cash_balance = self.current_capital * self.cash_allocation
+        cash_balance = self.allocated_capital * self.cash_allocation
         portfolio_value = (total_allocated + total_realized + total_unrealized - 
                           total_costs + cash_balance)
         
