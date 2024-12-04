@@ -21,9 +21,14 @@ class Strategy:
         self.allocated_capital = 0.0
         self.current_positions = {}  # symbol -> position size
         
-    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], costs_config: Dict) -> pd.Series:
+    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], costs_config: Dict, allocation_sign: int = 1) -> pd.Series:
         """
         Calculate strategy returns using price data and signals
+        
+        Parameters:
+        -----------
+        allocation_sign : int
+            1 for normal allocation, -1 for inverse positions
         """
         all_returns = []
         
@@ -37,7 +42,8 @@ class Strategy:
             
             # Align signals with price data
             positions = pd.DataFrame(index=prices.index)
-            positions['signal'] = symbol_signals.reindex(prices.index).ffill().fillna(0)
+            # Apply allocation sign to signals
+            positions['signal'] = symbol_signals.reindex(prices.index).ffill().fillna(0) * allocation_sign
             positions['price'] = prices['Close']
             positions['returns'] = prices['returns']
             
@@ -93,15 +99,25 @@ class Strategy:
         {symbol: (current_size, target_size)}
         """
         if not self.current_positions:
+            self.allocated_capital = new_capital
             return {}
-            
-        position_adjustments = {}
-        capital_ratio = new_capital / self.allocated_capital
         
-        for symbol, current_size in self.current_positions.items():
-            target_size = current_size * capital_ratio
-            if target_size != current_size:
-                position_adjustments[symbol] = (current_size, target_size)
+        position_adjustments = {}
+        
+        # Handle case where allocated_capital is zero
+        if self.allocated_capital == 0:
+            if new_capital > 0:
+                # Opening new positions
+                for symbol, current_size in self.current_positions.items():
+                    if current_size != 0:
+                        position_adjustments[symbol] = (0, current_size)
+        else:
+            # Normal case - adjust existing positions
+            capital_ratio = new_capital / self.allocated_capital
+            for symbol, current_size in self.current_positions.items():
+                target_size = current_size * capital_ratio
+                if not np.isclose(target_size, current_size):
+                    position_adjustments[symbol] = (current_size, target_size)
         
         self.allocated_capital = new_capital
         return position_adjustments
@@ -112,17 +128,36 @@ class Portfolio:
         self.current_capital = initial_capital
         self.strategies: Dict[str, Strategy] = {}
         self.allocations: Dict[str, float] = {}
+        self.allocation_signs: Dict[str, int] = {}  # 1 for normal, -1 for inverse
         self.returns = pd.DataFrame()
         self.rebalance_history = []
+        self.cash_allocation = 0.0
+        self.cash_history = None
+    
+    def add_strategy(self, strategy: Strategy, allocation: float, inverse: bool = False):
+        """
+        Add strategy with initial allocation
         
-    def add_strategy(self, strategy: Strategy, allocation: float):
-        """Add strategy with initial allocation"""
+        Parameters:
+        -----------
+        strategy : Strategy
+            Strategy to add
+        allocation : float
+            Capital allocation (0 to 1)
+        inverse : bool
+            Whether to take inverse positions
+        """
         if allocation < 0 or allocation > 1:
             raise ValueError("Allocation must be between 0 and 1")
+            
+        # Update cash allocation
+        self.cash_allocation = max(0, 1 - (sum(self.allocations.values()) + allocation))
+        
         self.strategies[strategy.name] = strategy
         self.allocations[strategy.name] = allocation
+        self.allocation_signs[strategy.name] = -1 if inverse else 1
         strategy.allocated_capital = self.current_capital * allocation
-        
+    
     def rebalance(self, new_allocations: Dict[str, float], prices: Dict[str, float]):
         """
         Rebalance strategy allocations and adjust positions
@@ -134,8 +169,10 @@ class Portfolio:
         prices : Dict[str, float]
             Current prices for all symbols
         """
-        if sum(new_allocations.values()) != 1:
-            raise ValueError("Allocations must sum to 1")
+        # Verify allocations including cash
+        total_allocation = sum(new_allocations.values()) + self.cash_allocation
+        if not np.isclose(total_allocation, 1.0, rtol=1e-5):
+            raise ValueError(f"Allocations (including cash) must sum to 1, got {total_allocation}")
         
         # Calculate new capital allocations
         position_adjustments = {}
@@ -153,6 +190,7 @@ class Portfolio:
             'timestamp': pd.Timestamp.now(),
             'old_allocations': self.allocations.copy(),
             'new_allocations': new_allocations.copy(),
+            'cash_allocation': self.cash_allocation,
             'position_adjustments': position_adjustments
         })
         
@@ -166,10 +204,17 @@ class Portfolio:
         
         # Calculate returns for each strategy
         for name, strategy in self.strategies.items():
-            strategy_returns[name] = strategy.calculate_returns(price_data, costs_config)
+            strategy_returns[name] = strategy.calculate_returns(
+                price_data, 
+                costs_config,
+                allocation_sign=self.allocation_signs[name]
+            )
         
         # Combine into DataFrame
         self.returns = pd.DataFrame(strategy_returns)
+        
+        # Initialize cash history
+        self.cash_history = pd.Series(self.cash_allocation, index=self.returns.index)
         
         # Calculate portfolio returns with time-varying weights
         portfolio_returns = pd.Series(0.0, index=self.returns.index)
@@ -187,11 +232,252 @@ class Portfolio:
             timestamp = rebalance['timestamp']
             if timestamp in current_allocations.index:
                 current_allocations.loc[timestamp:] = pd.Series(rebalance['new_allocations'])
+                self.cash_history.loc[timestamp:] = rebalance['cash_allocation']
         
         # Calculate portfolio returns with time-varying weights
         for t in range(len(portfolio_returns)):
             weights = current_allocations.iloc[t]
             portfolio_returns.iloc[t] = (self.returns.iloc[t] * weights).sum()
         
+        # Add cash returns (0) to returns DataFrame
+        self.returns['Cash'] = 0.0
         self.returns['Portfolio'] = portfolio_returns
+        
+        return self.returns
+
+class KellyPortfolio(Portfolio):
+    def __init__(self, initial_capital: float = 1000000, lookback_days: int = 30):
+        super().__init__(initial_capital)
+        self.lookback_hours = lookback_days * 24
+        self.bad_strategy_threshold = -0.5  # Kelly score below this is considered "bad"
+    
+    def calculate_kelly_criterion(self, returns: pd.Series) -> float:
+        """Calculate Kelly Criterion for a return series (returns raw score)"""
+        if len(returns) < self.lookback_hours:
+            return 0.0
+            
+        recent_returns = returns.iloc[-self.lookback_hours:]
+        
+        wins = recent_returns > 0
+        losses = recent_returns < 0
+        
+        if len(recent_returns[losses]) == 0:  # No losses
+            return 1.0
+        if len(recent_returns[wins]) == 0:  # No wins
+            return -1.0
+            
+        win_prob = len(recent_returns[wins]) / len(recent_returns)
+        avg_win = recent_returns[wins].mean() if len(recent_returns[wins]) > 0 else 0
+        avg_loss = abs(recent_returns[losses].mean())
+        
+        if avg_loss == 0:  # Avoid division by zero
+            return 0.0
+            
+        win_loss_ratio = avg_win / avg_loss
+        
+        kelly = win_prob - (1 - win_prob) / win_loss_ratio
+        return kelly  # Return raw score (can be negative)
+    
+    def optimize_allocations(self) -> Dict[str, float]:
+        """Calculate optimal allocations and determine which strategies to inverse"""
+        if not self.returns.empty:
+            kelly_scores = {}
+            
+            # Calculate Kelly Criterion for each strategy
+            for strategy_name in self.strategies:
+                returns = self.returns[strategy_name]
+                kelly = self.calculate_kelly_criterion(returns)
+                kelly_scores[strategy_name] = kelly
+                
+                # Update allocation signs based on Kelly scores
+                if kelly < self.bad_strategy_threshold:
+                    # Strategy is bad enough to inverse
+                    self.allocation_signs[strategy_name] = -1
+                    kelly_scores[strategy_name] = abs(kelly)  # Use absolute value for allocation
+                else:
+                    self.allocation_signs[strategy_name] = 1
+            
+            # Filter for strategies with significant Kelly scores
+            good_strategies = {k: v for k, v in kelly_scores.items() 
+                             if abs(v) > 1}  # Use absolute value for filtering
+            
+            if good_strategies:
+                # Normalize scores to sum to 1
+                total_score = sum(abs(v) for v in good_strategies.values())
+                allocations = {k: abs(v)/total_score for k, v in good_strategies.items()}
+                
+                # Add zero allocations for strategies not selected
+                for strategy in self.strategies:
+                    if strategy not in allocations:
+                        allocations[strategy] = 0.0
+                
+                self.cash_allocation = 0.0
+                
+                # Print allocation decisions
+                print("\nStrategy Allocations:")
+                for strategy, alloc in allocations.items():
+                    if alloc > 0:
+                        direction = "INVERSE" if self.allocation_signs[strategy] < 0 else "NORMAL"
+                        print(f"{strategy}: {alloc:.1%} ({direction}) - Kelly: {kelly_scores[strategy]:.2f}")
+            else:
+                # If no strategies have significant Kelly scores, go to cash
+                allocations = {k: 0.0 for k in self.strategies}
+                self.cash_allocation = 1.0
+                print("\nNo strategies meet Kelly criterion - Going to cash")
+                
+            return allocations
+        
+        # Default to equal weight if no returns data yet
+        return {k: 1.0/len(self.strategies) for k in self.strategies}
+    
+    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], 
+                         costs_config: Dict,
+                         rebalance_frequency: str = '30D') -> pd.DataFrame:
+        """Calculate returns and rebalance based on Kelly Criterion"""
+        # First calculate initial returns with normal allocations
+        super().calculate_returns(price_data, costs_config)
+        
+        # Get rebalancing dates
+        dates = pd.date_range(
+            start=self.returns.index[0],
+            end=self.returns.index[-1],
+            freq=rebalance_frequency
+        )
+        
+        # Rebalance at each date
+        for date in dates:
+            if date in self.returns.index:
+                # Get current prices for position adjustment
+                current_prices = {
+                    symbol: data.loc[date, 'Close'] 
+                    for symbol, data in price_data.items()
+                    if date in data.index
+                }
+                
+                # Calculate and apply new allocations
+                new_allocations = self.optimize_allocations()
+                self.rebalance(new_allocations, current_prices)
+                
+                # Recalculate returns with proper signs
+                for name, strategy in self.strategies.items():
+                    if self.allocation_signs[name] != 0:
+                        self.returns[name] = strategy.calculate_returns(
+                            price_data, 
+                            costs_config,
+                            allocation_sign=self.allocation_signs[name]
+                        )
+        
+        return self.returns
+
+class BadStrategyPortfolio(Portfolio):
+    def __init__(self, initial_capital: float = 1000000, lookback_days: int = 30):
+        super().__init__(initial_capital)
+        self.lookback_hours = lookback_days * 24
+        self.bad_strategy_threshold = -0.5  # Threshold for identifying bad strategies
+    
+    def calculate_strategy_score(self, returns: pd.Series) -> float:
+        """Calculate strategy score based on recent performance"""
+        if len(returns) < self.lookback_hours:
+            return 0.0
+            
+        recent_returns = returns.iloc[-self.lookback_hours:]
+        
+        # Calculate key metrics
+        win_rate = (recent_returns > 0).mean()
+        avg_win = recent_returns[recent_returns > 0].mean() if any(recent_returns > 0) else 0
+        avg_loss = recent_returns[recent_returns < 0].mean() if any(recent_returns < 0) else 0
+        sharpe = recent_returns.mean() / recent_returns.std() if recent_returns.std() != 0 else 0
+        
+        # Combine metrics into a score
+        score = (win_rate - 0.5) + sharpe + (avg_win/abs(avg_loss) if avg_loss != 0 else 0)
+        return score
+    
+    def optimize_allocations(self) -> Dict[str, float]:
+        """Find bad strategies to inverse"""
+        if not self.returns.empty:
+            strategy_scores = {}
+            
+            # Calculate scores for each strategy
+            for strategy_name in self.strategies:
+                returns = self.returns[strategy_name]
+                score = self.calculate_strategy_score(returns)
+                strategy_scores[strategy_name] = score
+                
+                # Update allocation signs - inverse bad strategies
+                if score < self.bad_strategy_threshold:
+                    self.allocation_signs[strategy_name] = -1
+                    print(f"\nInversing {strategy_name} (Score: {score:.2f})")
+                else:
+                    self.allocation_signs[strategy_name] = 1
+            
+            # Equal weight allocation to all strategies
+            n_strategies = len(self.strategies)
+            allocations = {k: 1.0/n_strategies for k in self.strategies}
+            self.cash_allocation = 0.0
+            
+            # Print allocation summary
+            print("\nStrategy Allocations:")
+            for strategy, alloc in allocations.items():
+                direction = "INVERSE" if self.allocation_signs[strategy] < 0 else "NORMAL"
+                print(f"{strategy}: {alloc:.1%} ({direction}) - Score: {strategy_scores[strategy]:.2f}")
+            
+            return allocations
+        
+        # Default to equal weight if no returns data yet
+        return {k: 1.0/len(self.strategies) for k in self.strategies}
+    
+    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], 
+                         costs_config: Dict,
+                         rebalance_frequency: str = '7D') -> pd.DataFrame:
+        """Calculate returns and check for strategies to inverse weekly"""
+        # First calculate initial returns
+        super().calculate_returns(price_data, costs_config)
+        
+        # Get rebalancing dates
+        dates = pd.date_range(
+            start=self.returns.index[0],
+            end=self.returns.index[-1],
+            freq=rebalance_frequency
+        )
+        
+        # Track strategy inversions
+        self.inversion_history = pd.DataFrame(index=self.returns.index, 
+                                            columns=self.strategies.keys(),
+                                            data=1)
+        
+        # Rebalance and check for inversions at each date
+        for date in dates:
+            if date in self.returns.index:
+                # Get current prices
+                current_prices = {
+                    symbol: data.loc[date, 'Close'] 
+                    for symbol, data in price_data.items()
+                    if date in data.index
+                }
+                
+                # Update allocations and inversions
+                new_allocations = self.optimize_allocations()
+                self.rebalance(new_allocations, current_prices)
+                
+                # Record inversions
+                for strategy in self.strategies:
+                    self.inversion_history.loc[date:, strategy] = self.allocation_signs[strategy]
+        
+        # Recalculate returns with inversions
+        strategy_returns = {}
+        for name, strategy in self.strategies.items():
+            # Apply time-varying inversions
+            returns = pd.Series(index=self.returns.index)
+            for t in range(len(returns)):
+                returns.iloc[t] = strategy.calculate_returns(
+                    price_data,
+                    costs_config,
+                    allocation_sign=self.inversion_history.loc[returns.index[t], name]
+                ).iloc[t]
+            strategy_returns[name] = returns
+        
+        self.returns = pd.DataFrame(strategy_returns)
+        self.returns['Portfolio'] = sum(self.returns[s] * self.allocations[s] 
+                                      for s in self.strategies)
+        
         return self.returns

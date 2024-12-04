@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Dict, Optional
 
 # Import our modules
-from modules.portfolio import Strategy, Portfolio
+from modules.portfolio import Strategy, Portfolio, KellyPortfolio
 from modules.data_loader import load_signals, get_price_data
 from modules.visualization import (
     plot_strategy_comparison, 
@@ -84,8 +84,8 @@ print(f"Last timestamp: {signals['timestamp'].max()}")
 print(f"Timestamp dtype: {signals['timestamp'].dtype}")
 
 # %% Create and run portfolio
-# Initialize portfolio
-portfolio = Portfolio(initial_capital=1000000)
+# Initialize Kelly Portfolio instead of regular Portfolio
+portfolio = KellyPortfolio(initial_capital=1000000, lookback_days=30)
 
 # Create strategies from signals
 for strategy_name in signals['strategy'].unique():
