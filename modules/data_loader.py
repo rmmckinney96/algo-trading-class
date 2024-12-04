@@ -37,7 +37,28 @@ def get_ticks(pair, script_dir, grain='1H', directory='prices/'):
     # Implementation remains the same but uses script_dir parameter
     ...
 
-def get_price_data(symbols, script_dir, grain='1H', directory='prices/'):
-    """Fetch OHLC data and calculate returns for multiple symbols"""
-    # Implementation remains the same but uses script_dir parameter
-    ... 
+def get_price_data(symbols, base_path, directory='prices/'):
+    """Load price data for multiple symbols."""
+    price_data = {}
+    
+    for symbol in symbols:
+        try:
+            file_path = os.path.join(base_path, directory, f'{symbol}_Candlestick_1_Hour_BID_01.01.2020-31.08.2024.csv')
+            if not os.path.exists(file_path):
+                print(f"Warning: Price file not found for {symbol}: {file_path}")
+                continue
+                
+            df = pd.read_csv(file_path)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            price_data[symbol] = df
+            
+        except Exception as e:
+            print(f"Error loading price data for {symbol}: {str(e)}")
+            continue
+    
+    if not price_data:
+        print("No price data could be loaded!")
+        return None
+        
+    return price_data 
