@@ -1,3 +1,7 @@
+# %% [markdown]
+# # Multi-Strategy Portfolio
+# %%
+
 from modules.data_loader import load_signals, get_price_data
 from modules.portfolio import (calculate_strategy_returns, 
                              calculate_portfolio_returns,
@@ -7,6 +11,10 @@ from modules.visualization import (plot_cumulative_returns,
                                  plot_rolling_volatility,
                                  plot_weights_history)
 import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,7 +33,18 @@ signal_configs = [
             }
         }
     },
-    # ... other configs
+    {
+        'file_path': "trade_logs/trade_log_jupyter.csv",
+        'mapping_config': {
+            'timestamp': {'from_column': 'Date'},
+            'strategy': 'Momentum Long-Only',
+            'symbol': 'USDJPY',
+            'signal': {
+                'map_from': 'Type',
+                'values': {'Buy': 1, 'Sell': 0}
+            }
+        }
+    }
 ]
 
 # Load and process data
