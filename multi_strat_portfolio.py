@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Dict, Optional
 
 # Import our modules
-from modules.portfolio import Strategy, Portfolio, KellyPortfolio, BadStrategyPortfolio
+from modules.portfolio import Strategy, KellyPortfolio, EqualWeightPortfolio
 from modules.data_loader import load_signals, get_price_data
 from modules.visualization import (
     plot_strategy_comparison, 
@@ -24,18 +24,18 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # %% Load and process data
 signal_configs = [
-    {
-        'file_path': "trade_logs/all_trading_logs.csv",
-        'mapping_config': {
-            'timestamp': {'from_column': 'Date'},
-            'strategy': {'from_column': 'Strategy'},
-            'symbol': 'USA500.IDXUSD',
-            'signal': {
-                'map_from': 'Action',
-                'values': {'Buy': 1, 'Sell': 0}
-            }
-        }
-    },
+    # {
+    #     'file_path': "trade_logs/all_trading_logs.csv",
+    #     'mapping_config': {
+    #         'timestamp': {'from_column': 'Date'},
+    #         'strategy': {'from_column': 'Strategy'},
+    #         'symbol': 'USA500.IDXUSD',
+    #         'signal': {
+    #             'map_from': 'Action',
+    #             'values': {'Buy': 1, 'Sell': 0}
+    #         }
+    #     }
+    # },
     {
         'file_path': "trade_logs/trade_log_jupyter.csv",
         'mapping_config': {
@@ -63,7 +63,7 @@ price_data = get_price_data(signals['symbol'].unique(), directory='prices/')
 
 # %% Create and run portfolio
 # Initialize portfolio
-portfolio = Portfolio(initial_capital=1000000)
+portfolio = EqualWeightPortfolio(initial_capital=1000000)  #KellyPortfolio(initial_capital=1000000, lookback_days=30)
 
 # Create strategies from signals
 for strategy_name in signals['strategy'].unique():
@@ -78,25 +78,31 @@ portfolio_returns = portfolio.calculate_returns(price_data, costs_config)
 print("\nPortfolio Summary")
 print("================")
 summary = portfolio.get_pnl_summary()
-print(summary)
+if not summary.empty:
+    print(summary.to_string(index=False))
+else:
+    print("No PnL data available yet")
 
 print("\nStrategy PnL Breakdown")
 print("=====================")
 for strategy_name in portfolio.strategies:
     strategy_pnl = portfolio.get_strategy_pnl(strategy_name)
-    print(f"\n{strategy_name}:")
-    print(f"Allocated Capital: ${strategy_pnl['allocated_capital'].iloc[-1]:,.2f}")
-    print(f"Realized PnL: ${strategy_pnl['realized_pnl'].iloc[-1]:,.2f}")
-    print(f"Unrealized PnL: ${strategy_pnl['unrealized_pnl'].iloc[-1]:,.2f}")
-    print(f"Total Costs: ${strategy_pnl['total_costs'].iloc[-1]:,.2f}")
-    print(f"Net PnL: ${(strategy_pnl['realized_pnl'].iloc[-1] + strategy_pnl['unrealized_pnl'].iloc[-1] - strategy_pnl['total_costs'].iloc[-1]):,.2f}")
-    
-    # Get trade history for this strategy
-    trades = portfolio.strategies[strategy_name].get_trade_history()
-    if not trades.empty:
-        print(f"Number of trades: {len(trades)}")
-        print(f"Average trade PnL: ${trades['realized_pnl'].mean():,.2f}")
-        print(f"Win rate: {(trades['realized_pnl'] > 0).mean():.1%}")
+    if not strategy_pnl.empty:
+        print(f"\n{strategy_name}:")
+        print(f"Allocated Capital: ${strategy_pnl['allocated_capital'].iloc[-1]:,.2f}")
+        print(f"Realized PnL: ${strategy_pnl['realized_pnl'].iloc[-1]:,.2f}")
+        print(f"Unrealized PnL: ${strategy_pnl['unrealized_pnl'].iloc[-1]:,.2f}")
+        print(f"Total Costs: ${strategy_pnl['total_costs'].iloc[-1]:,.2f}")
+        print(f"Net PnL: ${(strategy_pnl['realized_pnl'].iloc[-1] + strategy_pnl['unrealized_pnl'].iloc[-1] - strategy_pnl['total_costs'].iloc[-1]):,.2f}")
+        
+        # Get trade history for this strategy
+        trades = portfolio.strategies[strategy_name].get_trade_history()
+        if not trades.empty:
+            print(f"Number of trades: {len(trades)}")
+            print(f"Average trade PnL: ${trades['realized_pnl'].mean():,.2f}")
+            print(f"Win rate: {(trades['realized_pnl'] > 0).mean():.1%}")
+    else:
+        print(f"\n{strategy_name}: No trades executed yet")
 
 # %% Plot PnL Evolution
 plt.figure(figsize=(12, 6))
@@ -163,6 +169,60 @@ for strategy_name in portfolio.strategies:
         plt.title(f'{strategy_name} - Trade PnL Distribution')
         plt.xlabel('PnL ($)')
         plt.ylabel('Frequency')
+        plt.grid(True)
+        plt.show()
+
+# %% Portfolio Analytics
+# Calculate key performance metrics
+returns = portfolio.total_pnl.set_index('timestamp')['portfolio_value'].pct_change()
+cumulative_returns = (1 + returns).cumprod()
+drawdowns = (cumulative_returns - cumulative_returns.cummax()) / cumulative_returns.cummax()
+
+print("\nPortfolio Performance Metrics")
+print("============================")
+print(f"Total Return: {(cumulative_returns.iloc[-1] - 1):.2%}")
+print(f"Annualized Return: {(((1 + (cumulative_returns.iloc[-1] - 1)) ** (252/len(returns))) - 1):.2%}")
+print(f"Annualized Volatility: {returns.std() * np.sqrt(252):.2%}")
+print(f"Sharpe Ratio: {(returns.mean() / returns.std()) * np.sqrt(252):.2f}")
+print(f"Max Drawdown: {drawdowns.min():.2%}")
+print(f"Current Drawdown: {drawdowns.iloc[-1]:.2%}")
+
+# Plot portfolio metrics
+plot_portfolio_metrics(portfolio)
+
+# Plot drawdown analysis
+plot_drawdowns(portfolio)
+
+# Compare strategy performance
+plot_strategy_comparison(portfolio)
+
+# %% Strategy Analysis
+for strategy_name in portfolio.strategies:
+    print(f"\nStrategy Analysis: {strategy_name}")
+    print("=" * (len(strategy_name) + 18))
+    
+    # Get strategy-specific metrics
+    plot_strategy_analysis(portfolio, strategy_name)
+    
+    strategy_pnl = portfolio.get_strategy_pnl(strategy_name)
+    strategy_returns = (strategy_pnl['realized_pnl'] + strategy_pnl['unrealized_pnl'] - strategy_pnl['total_costs']).pct_change()
+    
+    if not strategy_returns.empty:
+        print("\nPerformance Metrics:")
+        print(f"Annualized Return: {(((1 + strategy_returns.sum()) ** (252/len(strategy_returns))) - 1):.2%}")
+        print(f"Annualized Volatility: {strategy_returns.std() * np.sqrt(252):.2%}")
+        print(f"Sharpe Ratio: {(strategy_returns.mean() / strategy_returns.std()) * np.sqrt(252):.2f}")
+        
+        # Calculate rolling metrics
+        rolling_sharpe = (
+            strategy_returns.rolling(window=30)
+            .agg(['mean', 'std'])
+            .apply(lambda x: x['mean'] / x['std'] * np.sqrt(252))
+        )
+        
+        # Plot rolling Sharpe ratio
+        plt.figure(figsize=(12, 4))
+        rolling_sharpe.plot(title=f'{strategy_name} - Rolling 30-Day Sharpe Ratio')
         plt.grid(True)
         plt.show()
 

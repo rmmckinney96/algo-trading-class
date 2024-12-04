@@ -2,6 +2,12 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Optional
 from tqdm.auto import tqdm
+from abc import ABC, abstractmethod
+import multiprocessing as mp
+from functools import partial
+from concurrent.futures import ProcessPoolExecutor
+import os
+import concurrent.futures
 
 class Position:
     def __init__(self, symbol: str, entry_time: pd.Timestamp, entry_price: float, 
@@ -32,7 +38,7 @@ class Strategy:
         self.allocated_capital = 0.0
         self.current_positions: Dict[str, Position] = {}
         
-        # Pre-allocate trade history with a reasonable size
+        # Pre-allocate trade history
         self.trade_history = pd.DataFrame(
             index=range(1000),  # Adjust size based on expected trades
             columns=['symbol', 'entry_time', 'exit_time', 'entry_price', 
@@ -40,7 +46,7 @@ class Strategy:
         )
         self.trade_count = 0
         
-        # Pre-allocate PnL history with index matching signals
+        # Pre-allocate PnL history
         self.pnl_history = pd.DataFrame(
             index=range(len(signals) * len(signals['symbol'].unique())),
             columns=['timestamp', 'symbol', 'realized_pnl', 'unrealized_pnl', 
@@ -84,141 +90,112 @@ class Strategy:
         """Get PnL history"""
         return self.pnl_history.iloc[:self.pnl_count].copy()
     
-    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], 
-                         costs_config: Dict, 
-                         allocation_sign: int = 1) -> pd.Series:
-        """Calculate returns and track positions/PnL"""
-        all_returns = []
+    def process_signals(self, price_data: Dict[str, pd.DataFrame], costs_config: Dict):
+        """Process signals and manage positions"""
+        # Group signals by timestamp
+        grouped_signals = self.signals.groupby('symbol')
         
-        for symbol in self.signals['symbol'].unique():
+        # Process each symbol's signals
+        for symbol, symbol_signals in tqdm(grouped_signals, desc=f"Processing {self.name} signals"):
             if symbol not in price_data:
                 continue
-            
+                
             prices = price_data[symbol]
-            symbol_signals = self.signals[self.signals['symbol'] == symbol]['signal']
             
-            # Initialize position tracking for this symbol
-            positions = pd.DataFrame(index=prices.index)
-            positions['signal'] = symbol_signals.reindex(prices.index).ffill().fillna(0) * allocation_sign
-            positions['price'] = prices['Close']
-            positions['size'] = positions['signal'] * self.allocated_capital / positions['price']
-            
-            # Track PnL for each timestamp
-            pnl_entries = []
-            current_position = None
-            
-            for t in range(len(positions)):
-                timestamp = positions.index[t]
-                curr_price = positions['price'].iloc[t]
-                curr_size = positions['size'].iloc[t]
-                
-                # Check for position changes
-                if current_position is None and curr_size != 0:
-                    # Opening new position
-                    current_position = Position(
-                        symbol=symbol,
-                        entry_time=timestamp,
-                        entry_price=curr_price,
-                        size=curr_size,
-                        direction=np.sign(curr_size)
-                    )
-                    self.current_positions[symbol] = current_position
+            # Process each signal
+            for timestamp, row in symbol_signals.iterrows():
+                if timestamp not in prices.index:
+                    continue
                     
-                    # Calculate entry costs
-                    entry_cost = abs(curr_size * curr_price) * (
-                        costs_config['transaction_fee_pct'] + 
-                        costs_config['slippage_pct']
-                    )
-                    current_position.costs += entry_cost
+                curr_price = prices.loc[timestamp, 'Close']
+                signal_value = row['signal']
                 
-                elif current_position is not None:
-                    if curr_size == 0:
-                        # Closing position
-                        exit_cost = abs(current_position.size * curr_price) * (
+                # Calculate position size based on allocated capital
+                position_size = signal_value * self.allocated_capital / curr_price
+                
+                # Check for existing position
+                if symbol in self.current_positions:
+                    current_pos = self.current_positions[symbol]
+                    
+                    if position_size == 0:  # Close position
+                        # Calculate exit costs
+                        exit_cost = abs(current_pos.size * curr_price) * (
                             costs_config['transaction_fee_pct'] + 
                             costs_config['slippage_pct']
                         )
-                        current_position.costs += exit_cost
+                        current_pos.costs += exit_cost
                         
                         # Calculate realized PnL
-                        price_pnl = (curr_price - current_position.entry_price) * current_position.size
-                        current_position.realized_pnl = price_pnl - current_position.costs
+                        price_pnl = (curr_price - current_pos.entry_price) * current_pos.size
+                        current_pos.realized_pnl = price_pnl - current_pos.costs
                         
                         # Record trade
                         self.record_trade({
                             'symbol': symbol,
-                            'entry_time': current_position.entry_time,
+                            'entry_time': current_pos.entry_time,
                             'exit_time': timestamp,
-                            'entry_price': current_position.entry_price,
+                            'entry_price': current_pos.entry_price,
                             'exit_price': curr_price,
-                            'size': current_position.size,
-                            'direction': current_position.direction,
-                            'realized_pnl': current_position.realized_pnl,
-                            'costs': current_position.costs
+                            'size': current_pos.size,
+                            'direction': current_pos.direction,
+                            'realized_pnl': current_pos.realized_pnl,
+                            'costs': current_pos.costs
                         })
                         
-                        current_position = None
-                        self.current_positions.pop(symbol, None)
-                    
-                    elif not np.isclose(curr_size, current_position.size):
-                        # Position size change
-                        size_change = curr_size - current_position.size
+                        # Remove position
+                        del self.current_positions[symbol]
                         
-                        # Calculate costs for the adjustment
+                    elif position_size != current_pos.size:  # Adjust position
+                        # Calculate adjustment costs
+                        size_change = position_size - current_pos.size
                         adjust_cost = abs(size_change * curr_price) * (
                             costs_config['transaction_fee_pct'] + 
                             costs_config['slippage_pct']
                         )
-                        current_position.costs += adjust_cost
-                        current_position.size = curr_size
+                        current_pos.costs += adjust_cost
+                        current_pos.size = position_size
+                        
+                elif position_size != 0:  # Open new position
+                    # Calculate entry costs
+                    entry_cost = abs(position_size * curr_price) * (
+                        costs_config['transaction_fee_pct'] + 
+                        costs_config['slippage_pct']
+                    )
+                    
+                    # Create new position
+                    self.current_positions[symbol] = Position(
+                        symbol=symbol,
+                        entry_time=timestamp,
+                        entry_price=curr_price,
+                        size=position_size,
+                        direction=np.sign(position_size)
+                    )
+                    self.current_positions[symbol].costs = entry_cost
                 
-                # Calculate unrealized PnL for current position
-                if current_position is not None:
-                    price_pnl = (curr_price - current_position.entry_price) * current_position.size
-                    current_position.unrealized_pnl = price_pnl - current_position.costs
+                # Update unrealized PnL for current position
+                if symbol in self.current_positions:
+                    pos = self.current_positions[symbol]
+                    price_pnl = (curr_price - pos.entry_price) * pos.size
+                    pos.unrealized_pnl = price_pnl - pos.costs
                     
                     # Add borrowing costs for short positions
-                    if current_position.size < 0:
-                        borrow_cost = (abs(current_position.size * curr_price) * 
+                    if pos.size < 0:
+                        borrow_cost = (abs(pos.size * curr_price) * 
                                      costs_config['borrowing_cost_pa'] / (24 * 252))
-                        current_position.costs += borrow_cost
+                        pos.costs += borrow_cost
                 
                 # Record PnL snapshot
-                pnl_entries.append({
+                self.record_pnl({
                     'timestamp': timestamp,
                     'symbol': symbol,
-                    'realized_pnl': current_position.realized_pnl if current_position else 0,
-                    'unrealized_pnl': current_position.unrealized_pnl if current_position else 0,
-                    'costs': current_position.costs if current_position else 0,
-                    'net_pnl': ((current_position.realized_pnl + current_position.unrealized_pnl) 
-                               if current_position else 0),
-                    'capital_used': abs(curr_size * curr_price) if current_position else 0
+                    'realized_pnl': pos.realized_pnl if symbol in self.current_positions else 0,
+                    'unrealized_pnl': pos.unrealized_pnl if symbol in self.current_positions else 0,
+                    'costs': pos.costs if symbol in self.current_positions else 0,
+                    'net_pnl': ((pos.realized_pnl + pos.unrealized_pnl) 
+                               if symbol in self.current_positions else 0),
+                    'capital_used': abs(position_size * curr_price) if position_size != 0 else 0
                 })
-            
-            # Update PnL history
-            symbol_pnl = pd.DataFrame(pnl_entries)
-            self.record_pnl({
-                'timestamp': symbol_pnl['timestamp'],
-                'symbol': symbol,
-                'realized_pnl': symbol_pnl['realized_pnl'].sum(),
-                'unrealized_pnl': symbol_pnl['unrealized_pnl'].sum(),
-                'costs': symbol_pnl['costs'].sum(),
-                'net_pnl': symbol_pnl['net_pnl'].sum(),
-                'capital_used': symbol_pnl['capital_used'].sum()
-            })
-            
-            # Calculate returns
-            returns = symbol_pnl['net_pnl'].diff() / self.allocated_capital
-            all_returns.append(returns)
-        
-        # Combine returns across symbols
-        if all_returns:
-            strategy_returns = pd.concat(all_returns, axis=1).sum(axis=1)
-        else:
-            strategy_returns = pd.Series(0, index=self.signals.index)
-        
-        return strategy_returns
-
+    
     def get_position_summary(self) -> pd.DataFrame:
         """Get current position summary"""
         summary = []
@@ -236,48 +213,42 @@ class Strategy:
             })
         return pd.DataFrame(summary)
 
-    def update_allocation(self, new_capital: float, prices: Dict[str, float]):
+    def update_allocation(self, new_capital: float) -> Dict[str, tuple]:
         """
         Update position sizes based on new capital allocation
         
         Returns dictionary of required position adjustments:
         {symbol: (current_size, target_size)}
         """
-        if not self.current_positions:
-            self.allocated_capital = new_capital
-            return {}
-        
         position_adjustments = {}
         
         # Handle case where allocated_capital is zero
         if self.allocated_capital == 0:
             if new_capital > 0:
                 # Opening new positions
-                for symbol, current_size in self.current_positions.items():
-                    if current_size != 0:
-                        position_adjustments[symbol] = (0, current_size)
+                for symbol, current_pos in self.current_positions.items():
+                    if current_pos.size != 0:
+                        position_adjustments[symbol] = (0, current_pos.size)
         else:
             # Normal case - adjust existing positions
             capital_ratio = new_capital / self.allocated_capital
-            for symbol, current_size in self.current_positions.items():
-                target_size = current_size * capital_ratio
-                if not np.isclose(target_size, current_size):
-                    position_adjustments[symbol] = (current_size, target_size)
+            for symbol, current_pos in self.current_positions.items():
+                target_size = current_pos.size * capital_ratio
+                if not np.isclose(target_size, current_pos.size):
+                    position_adjustments[symbol] = (current_pos.size, target_size)
         
         self.allocated_capital = new_capital
         return position_adjustments
 
-class Portfolio:
+class Portfolio(ABC):
     def __init__(self, initial_capital: float = 1000000):
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
         self.strategies: Dict[str, Strategy] = {}
         self.allocations: Dict[str, float] = {}
         self.allocation_signs: Dict[str, int] = {}  # 1 for normal, -1 for inverse
-        self.returns = pd.DataFrame()
-        self.rebalance_history = []
         self.cash_allocation = 0.0
-        self.cash_history = None
+        self.rebalance_history = []
         
         # Track capital and PnL
         self.capital_history = pd.DataFrame(columns=[
@@ -289,53 +260,14 @@ class Portfolio:
             'total_unrealized_pnl', 'total_costs', 'cash_balance',
             'portfolio_value'
         ])
+        self.returns = pd.DataFrame()
     
-    def update_pnl_tracking(self, timestamp: pd.Timestamp):
-        """Update PnL tracking at a given timestamp"""
-        # Pre-allocate arrays for strategy metrics
-        n_strategies = len(self.strategies)
-        strategy_names = []
-        allocated_capitals = np.zeros(n_strategies)
-        realized_pnls = np.zeros(n_strategies)
-        unrealized_pnls = np.zeros(n_strategies)
-        total_costs = np.zeros(n_strategies)
-        
-        # Track strategy-level metrics with progress bar
-        for i, (name, strategy) in enumerate(tqdm(self.strategies.items(), desc="Updating strategy metrics")):
-            position_summary = strategy.get_position_summary()
-            
-            strategy_names.append(name)
-            allocated_capitals[i] = strategy.allocated_capital
-            realized_pnls[i] = position_summary['realized_pnl'].sum() if not position_summary.empty else 0
-            unrealized_pnls[i] = position_summary['unrealized_pnl'].sum() if not position_summary.empty else 0
-            total_costs[i] = position_summary['costs'].sum() if not position_summary.empty else 0
-        
-        # Update capital history using loc
-        idx = len(self.capital_history)
-        self.capital_history.loc[idx:idx+n_strategies-1, 'timestamp'] = timestamp
-        self.capital_history.loc[idx:idx+n_strategies-1, 'strategy'] = strategy_names
-        self.capital_history.loc[idx:idx+n_strategies-1, 'allocated_capital'] = allocated_capitals
-        self.capital_history.loc[idx:idx+n_strategies-1, 'realized_pnl'] = realized_pnls
-        self.capital_history.loc[idx:idx+n_strategies-1, 'unrealized_pnl'] = unrealized_pnls
-        self.capital_history.loc[idx:idx+n_strategies-1, 'total_costs'] = total_costs
-        
-        # Calculate portfolio totals
-        total_allocated = allocated_capitals.sum()
-        total_realized = realized_pnls.sum()
-        total_unrealized = unrealized_pnls.sum()
-        total_costs_sum = total_costs.sum()
-        cash_balance = self.current_capital * self.cash_allocation
-        portfolio_value = total_allocated + total_realized + total_unrealized - total_costs_sum + cash_balance
-        
-        # Update total PnL using loc
-        idx = len(self.total_pnl)
-        self.total_pnl.loc[idx, 'timestamp'] = timestamp
-        self.total_pnl.loc[idx, 'total_allocated'] = total_allocated
-        self.total_pnl.loc[idx, 'total_realized_pnl'] = total_realized
-        self.total_pnl.loc[idx, 'total_unrealized_pnl'] = total_unrealized
-        self.total_pnl.loc[idx, 'total_costs'] = total_costs_sum
-        self.total_pnl.loc[idx, 'cash_balance'] = cash_balance
-        self.total_pnl.loc[idx, 'portfolio_value'] = portfolio_value
+    def _update_strategy_allocation(self, strategy_name: str, new_alloc: float) -> tuple:
+        """Update a single strategy's allocation"""
+        strategy = self.strategies[strategy_name]
+        new_capital = self.current_capital * new_alloc
+        strategy_adjustments = strategy.update_allocation(new_capital)
+        return strategy_name, strategy_adjustments
     
     def add_strategy(self, strategy: Strategy, allocation: float, inverse: bool = False):
         """
@@ -361,6 +293,98 @@ class Portfolio:
         self.allocation_signs[strategy.name] = -1 if inverse else 1
         strategy.allocated_capital = self.current_capital * allocation
     
+    @abstractmethod
+    def optimize_allocations(self) -> Dict[str, float]:
+        """
+        Calculate optimal allocations for each strategy
+        
+        Returns:
+        --------
+        Dict[str, float]
+            Dictionary mapping strategy names to their allocations (0 to 1)
+            The sum of allocations should be <= 1, with remainder going to cash
+        """
+        pass
+    
+    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], 
+                         costs_config: Dict,
+                         rebalance_frequency: str = '30D') -> pd.DataFrame:
+        """Calculate portfolio returns and rebalance periodically"""
+        # Get all timestamps from price data
+        all_timestamps = sorted(set().union(*[df.index for df in price_data.values()]))
+        
+        # Initialize returns DataFrame
+        self.returns = pd.DataFrame(index=all_timestamps, 
+                                  columns=list(self.strategies.keys()) + ['Portfolio'])
+        
+        # Get rebalancing dates
+        dates = pd.date_range(
+            start=all_timestamps[0],
+            end=all_timestamps[-1],
+            freq=rebalance_frequency
+        )
+        
+        # Pre-allocate arrays for faster computation
+        n_timestamps = len(all_timestamps)
+        portfolio_values = np.zeros(n_timestamps)
+        portfolio_values[0] = self.initial_capital
+        strategy_returns = {name: np.zeros(n_timestamps) for name in self.strategies}
+        
+        # Initial allocation and signal processing
+        for name, strategy in tqdm(self.strategies.items(), desc="Processing initial signals"):
+            strategy.process_signals(price_data, costs_config)
+        
+        # Process each timestamp
+        for i, timestamp in enumerate(tqdm(all_timestamps, desc="Calculating returns")):
+            # Check for rebalancing
+            if timestamp in dates:
+                # Get current prices for position adjustment
+                current_prices = {
+                    symbol: data.loc[timestamp, 'Close'] 
+                    for symbol, data in price_data.items()
+                    if timestamp in data.index
+                }
+                
+                # Calculate and apply new allocations
+                new_allocations = self.optimize_allocations()
+                self.rebalance(new_allocations, current_prices)
+            
+            # Calculate PnL for this timestamp
+            total_pnl = 0
+            prev_value = portfolio_values[i-1] if i > 0 else self.initial_capital
+            
+            # Get PnL for each strategy
+            for name, strategy in self.strategies.items():
+                position_summary = strategy.get_position_summary()
+                if not position_summary.empty:
+                    # Calculate net PnL
+                    realized = position_summary['realized_pnl'].sum()
+                    unrealized = position_summary['unrealized_pnl'].sum()
+                    costs = position_summary['costs'].sum()
+                    net_pnl = (realized + unrealized - costs) * self.allocation_signs[name]
+                    
+                    total_pnl += net_pnl
+                    strategy_returns[name][i] = net_pnl / prev_value if prev_value != 0 else 0
+                else:
+                    strategy_returns[name][i] = 0
+            
+            # Update portfolio value
+            portfolio_values[i] = prev_value + total_pnl
+            
+            # Update PnL tracking
+            self.update_pnl_tracking(timestamp)
+        
+        # Calculate portfolio returns
+        portfolio_returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        portfolio_returns = np.insert(portfolio_returns, 0, 0)  # Add 0 return for first timestamp
+        
+        # Update returns DataFrame efficiently
+        for name, returns in strategy_returns.items():
+            self.returns[name] = returns
+        self.returns['Portfolio'] = portfolio_returns
+        
+        return self.returns
+
     def rebalance(self, new_allocations: Dict[str, float], prices: Dict[str, float]):
         """
         Rebalance strategy allocations and adjust positions
@@ -377,16 +401,12 @@ class Portfolio:
         if not np.isclose(total_allocation, 1.0, rtol=1e-5):
             raise ValueError(f"Allocations (including cash) must sum to 1, got {total_allocation}")
         
-        # Calculate new capital allocations
+        # Update each strategy's allocation
         position_adjustments = {}
         for strategy_name, new_alloc in new_allocations.items():
-            strategy = self.strategies[strategy_name]
-            new_capital = self.current_capital * new_alloc
-            
-            # Get required position adjustments
-            strategy_adjustments = strategy.update_allocation(new_capital, prices)
-            if strategy_adjustments:
-                position_adjustments[strategy_name] = strategy_adjustments
+            name, adjustments = self._update_strategy_allocation(strategy_name, new_alloc)
+            if adjustments:
+                position_adjustments[name] = adjustments
         
         # Record rebalance
         self.rebalance_history.append({
@@ -402,87 +422,50 @@ class Portfolio:
         
         # Update PnL tracking after rebalance
         self.update_pnl_tracking(pd.Timestamp.now())
-    
-    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], 
-                         costs_config: Dict) -> pd.DataFrame:
-        """Calculate returns and track PnL"""
-        strategy_returns = {}
-        
-        # Calculate returns for each strategy
+
+    def update_pnl_tracking(self, timestamp: pd.Timestamp):
+        """Update PnL tracking at a given timestamp"""
+        # Track strategy-level metrics
+        strategy_metrics = []
         for name, strategy in self.strategies.items():
-            strategy_returns[name] = strategy.calculate_returns(
-                price_data, 
-                costs_config,
-                allocation_sign=self.allocation_signs[name]
-            )
+            position_summary = strategy.get_position_summary()
+            
+            metrics = {
+                'timestamp': timestamp,
+                'strategy': name,
+                'allocated_capital': strategy.allocated_capital,
+                'realized_pnl': position_summary['realized_pnl'].sum() if not position_summary.empty else 0,
+                'unrealized_pnl': position_summary['unrealized_pnl'].sum() if not position_summary.empty else 0,
+                'total_costs': position_summary['costs'].sum() if not position_summary.empty else 0
+            }
+            strategy_metrics.append(metrics)
         
-        # Combine into DataFrame
-        self.returns = pd.DataFrame(strategy_returns)
+        # Update capital history
+        new_capital_history = pd.DataFrame(strategy_metrics)
+        self.capital_history = pd.concat([self.capital_history, new_capital_history], ignore_index=True)
         
-        # Initialize cash history
-        self.cash_history = pd.Series(self.cash_allocation, index=self.returns.index)
+        # Calculate portfolio totals
+        total_allocated = sum(s.allocated_capital for s in self.strategies.values())
+        total_realized = sum(m['realized_pnl'] for m in strategy_metrics)
+        total_unrealized = sum(m['unrealized_pnl'] for m in strategy_metrics)
+        total_costs = sum(m['total_costs'] for m in strategy_metrics)
+        cash_balance = self.current_capital * self.cash_allocation
+        portfolio_value = (total_allocated + total_realized + total_unrealized - 
+                         total_costs + cash_balance)
         
-        # Calculate portfolio returns with time-varying weights
-        portfolio_returns = pd.Series(0.0, index=self.returns.index)
-        
-        # Apply allocations and rebalancing
-        current_allocations = pd.DataFrame(index=self.returns.index, 
-                                         columns=self.strategies.keys(),
-                                         data=0.0)
-        
-        # Fill initial allocations
-        current_allocations.iloc[0] = pd.Series(self.allocations)
-        
-        # Apply rebalancing events
-        for rebalance in self.rebalance_history:
-            timestamp = rebalance['timestamp']
-            if timestamp in current_allocations.index:
-                current_allocations.loc[timestamp:] = pd.Series(rebalance['new_allocations'])
-                self.cash_history.loc[timestamp:] = rebalance['cash_allocation']
-        
-        # Calculate portfolio returns with time-varying weights
-        for t in range(len(portfolio_returns)):
-            weights = current_allocations.iloc[t]
-            portfolio_returns.iloc[t] = (self.returns.iloc[t] * weights).sum()
-        
-        # Add cash returns (0) to returns DataFrame
-        self.returns['Cash'] = 0.0
-        self.returns['Portfolio'] = portfolio_returns
-        
-        # Update PnL tracking for each timestamp
-        for timestamp in self.returns.index:
-            self.update_pnl_tracking(timestamp)
-        
-        return self.returns
-    
-    def get_pnl_summary(self, start_date: Optional[pd.Timestamp] = None, 
-                       end_date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
-        """Get PnL summary for a date range"""
-        pnl = self.total_pnl.copy()
-        
-        if start_date:
-            pnl = pnl[pnl['timestamp'] >= start_date]
-        if end_date:
-            pnl = pnl[pnl['timestamp'] <= end_date]
-        
-        # Calculate period metrics
-        summary = pd.DataFrame({
-            'Initial Value': [self.initial_capital],
-            'Final Value': [pnl['portfolio_value'].iloc[-1]],
-            'Total Return': [pnl['portfolio_value'].iloc[-1] / self.initial_capital - 1],
-            'Realized PnL': [pnl['total_realized_pnl'].iloc[-1]],
-            'Unrealized PnL': [pnl['total_unrealized_pnl'].iloc[-1]],
-            'Total Costs': [pnl['total_costs'].iloc[-1]],
-            'Current Cash': [pnl['cash_balance'].iloc[-1]]
-        })
-        
-        return summary
-    
-    def get_strategy_pnl(self, strategy_name: str) -> pd.DataFrame:
-        """Get detailed PnL history for a specific strategy"""
-        return self.capital_history[
-            self.capital_history['strategy'] == strategy_name
-        ].set_index('timestamp')
+        # Update total PnL tracking
+        self.total_pnl = pd.concat([
+            self.total_pnl,
+            pd.DataFrame([{
+                'timestamp': timestamp,
+                'total_allocated': total_allocated,
+                'total_realized_pnl': total_realized,
+                'total_unrealized_pnl': total_unrealized,
+                'total_costs': total_costs,
+                'cash_balance': cash_balance,
+                'portfolio_value': portfolio_value
+            }])
+        ], ignore_index=True)
 
 class KellyPortfolio(Portfolio):
     def __init__(self, initial_capital: float = 1000000, lookback_days: int = 30):
@@ -490,24 +473,27 @@ class KellyPortfolio(Portfolio):
         self.lookback_hours = lookback_days * 24
         self.bad_strategy_threshold = -0.5  # Kelly score below this is considered "bad"
     
-    def calculate_kelly_criterion(self, returns: pd.Series) -> float:
-        """Calculate Kelly Criterion for a return series (returns raw score)"""
-        if len(returns) < self.lookback_hours:
+    def calculate_kelly_criterion(self, pnl_history: pd.DataFrame) -> float:
+        """Calculate Kelly Criterion for a strategy's PnL history"""
+        if len(pnl_history) < self.lookback_hours:
             return 0.0
             
-        recent_returns = returns.iloc[-self.lookback_hours:]
+        recent_pnl = pnl_history.iloc[-self.lookback_hours:]
         
-        wins = recent_returns > 0
-        losses = recent_returns < 0
+        # Calculate PnL changes
+        pnl_changes = recent_pnl['net_pnl'].diff().dropna()
         
-        if len(recent_returns[losses]) == 0:  # No losses
+        wins = pnl_changes > 0
+        losses = pnl_changes < 0
+        
+        if len(pnl_changes[losses]) == 0:  # No losses
             return 1.0
-        if len(recent_returns[wins]) == 0:  # No wins
+        if len(pnl_changes[wins]) == 0:  # No wins
             return -1.0
             
-        win_prob = len(recent_returns[wins]) / len(recent_returns)
-        avg_win = recent_returns[wins].mean() if len(recent_returns[wins]) > 0 else 0
-        avg_loss = abs(recent_returns[losses].mean())
+        win_prob = len(pnl_changes[wins]) / len(pnl_changes)
+        avg_win = pnl_changes[wins].mean() if len(pnl_changes[wins]) > 0 else 0
+        avg_loss = abs(pnl_changes[losses].mean())
         
         if avg_loss == 0:  # Avoid division by zero
             return 0.0
@@ -518,232 +504,124 @@ class KellyPortfolio(Portfolio):
         return kelly  # Return raw score (can be negative)
     
     def optimize_allocations(self) -> Dict[str, float]:
-        """Calculate optimal allocations and determine which strategies to inverse"""
-        if not self.returns.empty:
-            kelly_scores = {}
+        """Calculate optimal allocations using Kelly Criterion"""
+        kelly_scores = {}
+        
+        # Calculate Kelly Criterion for each strategy
+        for name, strategy in self.strategies.items():
+            pnl_history = strategy.get_pnl_history()
+            kelly = self.calculate_kelly_criterion(pnl_history)
+            kelly_scores[name] = kelly
             
-            # Calculate Kelly Criterion for each strategy
-            for strategy_name in self.strategies:
-                returns = self.returns[strategy_name]
-                kelly = self.calculate_kelly_criterion(returns)
-                kelly_scores[strategy_name] = kelly
-                
-                # Update allocation signs based on Kelly scores
-                if kelly < self.bad_strategy_threshold:
-                    # Strategy is bad enough to inverse
-                    self.allocation_signs[strategy_name] = -1
-                    kelly_scores[strategy_name] = abs(kelly)  # Use absolute value for allocation
-                else:
-                    self.allocation_signs[strategy_name] = 1
-            
-            # Filter for strategies with significant Kelly scores
-            good_strategies = {k: v for k, v in kelly_scores.items() 
-                             if abs(v) > 1}  # Use absolute value for filtering
-            
-            if good_strategies:
-                # Normalize scores to sum to 1
-                total_score = sum(abs(v) for v in good_strategies.values())
-                allocations = {k: abs(v)/total_score for k, v in good_strategies.items()}
-                
-                # Add zero allocations for strategies not selected
-                for strategy in self.strategies:
-                    if strategy not in allocations:
-                        allocations[strategy] = 0.0
-                
-                self.cash_allocation = 0.0
-                
-                # Print allocation decisions
-                print("\nStrategy Allocations:")
-                for strategy, alloc in allocations.items():
-                    if alloc > 0:
-                        direction = "INVERSE" if self.allocation_signs[strategy] < 0 else "NORMAL"
-                        print(f"{strategy}: {alloc:.1%} ({direction}) - Kelly: {kelly_scores[strategy]:.2f}")
+            # Update allocation signs based on Kelly scores
+            if kelly < self.bad_strategy_threshold:
+                # Strategy is bad enough to inverse
+                self.allocation_signs[name] = -1
+                kelly_scores[name] = abs(kelly)  # Use absolute value for allocation
             else:
-                # If no strategies have significant Kelly scores, go to cash
-                allocations = {k: 0.0 for k in self.strategies}
-                self.cash_allocation = 1.0
-                print("\nNo strategies meet Kelly criterion - Going to cash")
-                
-            return allocations
+                self.allocation_signs[name] = 1
         
-        # Default to equal weight if no returns data yet
-        return {k: 1.0/len(self.strategies) for k in self.strategies}
-    
-    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], 
-                         costs_config: Dict,
-                         rebalance_frequency: str = '30D') -> pd.DataFrame:
-        """Calculate returns and rebalance based on Kelly Criterion"""
-        # First calculate initial returns with normal allocations
-        super().calculate_returns(price_data, costs_config)
+        # Filter for strategies with significant Kelly scores
+        good_strategies = {k: v for k, v in kelly_scores.items() 
+                         if abs(v) > 0.1}  # Use absolute value for filtering
         
-        # Get rebalancing dates
-        dates = pd.date_range(
-            start=self.returns.index[0],
-            end=self.returns.index[-1],
-            freq=rebalance_frequency
-        )
-        
-        # Rebalance at each date
-        for date in dates:
-            if date in self.returns.index:
-                # Get current prices for position adjustment
-                current_prices = {
-                    symbol: data.loc[date, 'Close'] 
-                    for symbol, data in price_data.items()
-                    if date in data.index
-                }
-                
-                # Calculate and apply new allocations
-                new_allocations = self.optimize_allocations()
-                self.rebalance(new_allocations, current_prices)
-                
-                # Recalculate returns with proper signs
-                for name, strategy in self.strategies.items():
-                    if self.allocation_signs[name] != 0:
-                        self.returns[name] = strategy.calculate_returns(
-                            price_data, 
-                            costs_config,
-                            allocation_sign=self.allocation_signs[name]
-                        )
-        
-        return self.returns
-
-class BadStrategyPortfolio(Portfolio):
-    def __init__(self, initial_capital: float = 1000000, lookback_days: int = 30):
-        super().__init__(initial_capital)
-        self.lookback_hours = lookback_days * 24
-        self.bad_strategy_threshold = -0.5  # Threshold for identifying bad strategies
-    
-    def calculate_strategy_score(self, returns: pd.Series) -> float:
-        """Calculate strategy score based on recent performance"""
-        if len(returns) < self.lookback_hours:
-            return 0.0
+        if good_strategies:
+            # Normalize scores to sum to 1
+            total_score = sum(abs(v) for v in good_strategies.values())
+            allocations = {k: abs(v)/total_score for k, v in good_strategies.items()}
             
-        recent_returns = returns.iloc[-self.lookback_hours:]
-        
-        # Calculate key metrics
-        win_rate = (recent_returns > 0).mean()
-        avg_win = recent_returns[recent_returns > 0].mean() if any(recent_returns > 0) else 0
-        avg_loss = recent_returns[recent_returns < 0].mean() if any(recent_returns < 0) else 0
-        sharpe = recent_returns.mean() / recent_returns.std() if recent_returns.std() != 0 else 0
-        
-        # Combine metrics into a score
-        score = (win_rate - 0.5) + sharpe + (avg_win/abs(avg_loss) if avg_loss != 0 else 0)
-        return score
-    
-    def optimize_allocations(self) -> Dict[str, float]:
-        """Find bad strategies to inverse"""
-        if not self.returns.empty:
-            strategy_scores = {}
+            # Add zero allocations for strategies not selected
+            for strategy in self.strategies:
+                if strategy not in allocations:
+                    allocations[strategy] = 0.0
             
-            # Calculate scores for each strategy
-            for strategy_name in self.strategies:
-                returns = self.returns[strategy_name]
-                score = self.calculate_strategy_score(returns)
-                strategy_scores[strategy_name] = score
-                
-                # Update allocation signs - inverse bad strategies
-                if score < self.bad_strategy_threshold:
-                    self.allocation_signs[strategy_name] = -1
-                    print(f"\nInversing {strategy_name} (Score: {score:.2f})")
-                else:
-                    self.allocation_signs[strategy_name] = 1
-            
-            # Equal weight allocation to all strategies
-            n_strategies = len(self.strategies)
-            allocations = {k: 1.0/n_strategies for k in self.strategies}
             self.cash_allocation = 0.0
             
-            # Print allocation summary
-            print("\nStrategy Allocations:")
+            # Print allocation decisions
+            print("\nKelly Portfolio Allocations:")
             for strategy, alloc in allocations.items():
-                direction = "INVERSE" if self.allocation_signs[strategy] < 0 else "NORMAL"
-                print(f"{strategy}: {alloc:.1%} ({direction}) - Score: {strategy_scores[strategy]:.2f}")
-            
-            return allocations
+                if alloc > 0:
+                    direction = "INVERSE" if self.allocation_signs[strategy] < 0 else "NORMAL"
+                    print(f"{strategy}: {alloc:.1%} ({direction}) - Kelly: {kelly_scores[strategy]:.2f}")
+        else:
+            # If no strategies have significant Kelly scores, go to cash
+            allocations = {k: 0.0 for k in self.strategies}
+            self.cash_allocation = 1.0
+            print("\nNo strategies meet Kelly criterion - Going to cash")
         
-        # Default to equal weight if no returns data yet
-        return {k: 1.0/len(self.strategies) for k in self.strategies}
-    
-    def calculate_returns(self, price_data: Dict[str, pd.DataFrame], 
-                         costs_config: Dict,
-                         rebalance_frequency: str = '7D') -> pd.DataFrame:
-        """Calculate returns and check for strategies to inverse weekly"""
-        # First calculate initial returns
-        super().calculate_returns(price_data, costs_config)
-        
-        # Get rebalancing dates
-        dates = pd.date_range(
-            start=self.returns.index[0],
-            end=self.returns.index[-1],
-            freq=rebalance_frequency
-        )
-        
-        # Track strategy inversions
-        self.inversion_history = pd.DataFrame(index=self.returns.index, 
-                                            columns=self.strategies.keys(),
-                                            data=1)
-        
-        # Rebalance and check for inversions at each date
-        for date in dates:
-            if date in self.returns.index:
-                # Get current prices
-                current_prices = {
-                    symbol: data.loc[date, 'Close'] 
-                    for symbol, data in price_data.items()
-                    if date in data.index
-                }
-                
-                # Update allocations and inversions
-                new_allocations = self.optimize_allocations()
-                self.rebalance(new_allocations, current_prices)
-                
-                # Record inversions
-                for strategy in self.strategies:
-                    self.inversion_history.loc[date:, strategy] = self.allocation_signs[strategy]
-        
-        # Recalculate returns with inversions
-        strategy_returns = {}
-        for name, strategy in self.strategies.items():
-            # Apply time-varying inversions
-            returns = pd.Series(index=self.returns.index)
-            for t in range(len(returns)):
-                returns.iloc[t] = strategy.calculate_returns(
-                    price_data,
-                    costs_config,
-                    allocation_sign=self.inversion_history.loc[returns.index[t], name]
-                ).iloc[t]
-            strategy_returns[name] = returns
-        
-        self.returns = pd.DataFrame(strategy_returns)
-        self.returns['Portfolio'] = sum(self.returns[s] * self.allocations[s] 
-                                      for s in self.strategies)
-        
-        return self.returns
+        return allocations
 
-    def process_signals(self, signals: pd.DataFrame, price_data: Dict[str, pd.DataFrame]):
-        """Process strategy signals and update positions"""
-        # Group signals by timestamp to process in order
-        grouped_signals = signals.groupby('timestamp')
-        
-        # Process signals in chronological order with progress bar
-        for timestamp, timestamp_signals in tqdm(grouped_signals, desc="Processing strategy signals"):
-            # Update positions based on signals
-            for _, signal in timestamp_signals.iterrows():
-                symbol = signal['symbol']
-                signal_value = signal['signal']
-                
-                if symbol not in price_data:
-                    continue
-                    
-                symbol_prices = price_data[symbol]
-                if timestamp not in symbol_prices.index:
-                    continue
-                    
-                current_price = symbol_prices.loc[timestamp, 'close']
-                
-                # Process the signal
-                self._process_signal(timestamp, symbol, signal_value, current_price)
+class EqualWeightPortfolio(Portfolio):
+    """Simple portfolio that allocates capital equally among all strategies"""
+    
+    def optimize_allocations(self) -> Dict[str, float]:
+        """Equal weight allocation to all strategies"""
+        n_strategies = len(self.strategies)
+        if n_strategies == 0:
+            return {}
             
-            # Update PnL tracking
-            self.update_pnl_tracking(timestamp)
+        allocation = 1.0 / n_strategies
+        allocations = {name: allocation for name in self.strategies}
+        self.cash_allocation = 0.0
+        
+        return allocations
+    
+    def get_pnl_summary(self) -> pd.DataFrame:
+        """Generate a summary of portfolio PnL metrics."""
+        if self.total_pnl is None:
+            return pd.DataFrame()
+        
+        returns = self.total_pnl.set_index('timestamp')['portfolio_value'].pct_change()
+        cumulative_returns = (1 + returns).cumprod()
+        drawdowns = (cumulative_returns - cumulative_returns.cummax()) / cumulative_returns.cummax()
+        
+        summary = pd.DataFrame({
+            'Metric': [
+                'Initial Capital',
+                'Current Portfolio Value',
+                'Total Return',
+                'Annualized Return',
+                'Annualized Volatility',
+                'Sharpe Ratio',
+                'Max Drawdown',
+                'Current Drawdown'
+            ],
+            'Value': [
+                f"${self.initial_capital:,.2f}",
+                f"${self.total_pnl['portfolio_value'].iloc[-1]:,.2f}",
+                f"{(cumulative_returns.iloc[-1] - 1):.2%}",
+                f"{(((1 + (cumulative_returns.iloc[-1] - 1)) ** (252/len(returns))) - 1):.2%}",
+                f"{returns.std() * np.sqrt(252):.2%}",
+                f"{(returns.mean() / returns.std()) * np.sqrt(252):.2f}",
+                f"{drawdowns.min():.2%}",
+                f"{drawdowns.iloc[-1]:.2%}"
+            ]
+        })
+        
+        return summary
+    
+    def get_strategy_pnl(self, strategy_name: str) -> pd.DataFrame:
+        """Get PnL breakdown for a specific strategy."""
+        if strategy_name not in self.strategies:
+            return pd.DataFrame()
+        
+        strategy = self.strategies[strategy_name]
+        
+        # Get capital allocation history for this strategy
+        capital_history = self.capital_history[self.capital_history['strategy'] == strategy_name]
+        
+        # Get trade history and calculate PnL components
+        trades = strategy.get_trade_history()
+        if trades.empty:
+            return pd.DataFrame()
+        
+        # Create a DataFrame with all components
+        pnl_df = pd.DataFrame({
+            'timestamp': capital_history['timestamp'],
+            'allocated_capital': capital_history['allocated_capital'],
+            'realized_pnl': trades['realized_pnl'].cumsum(),
+            'unrealized_pnl': trades['unrealized_pnl'],
+            'total_costs': trades['total_costs'].cumsum()
+        })
+        
+        return pnl_df
